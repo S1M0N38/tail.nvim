@@ -7,7 +7,7 @@ optionally display a timestamp before each new line using virtual text.
 
 - Auto-scrolls to the bottom of any buffer as new lines are added (if already at bottom)
 - Respects user scrolling: won't yank you back if you've moved up
-- Works on any buffer type: `nofile`, plugin buffers, etc.
+- Works on any buffer type: `nofile`, plugin buffers, etc. Your mileage may vary for "exotic" buffers like :terminal
 - Optional per-buffer timestamps: prefix newly inserted lines with the current time. The timestamp is drawn with virtual text, so it does not modify the file’s content.
 
 ## Usage
