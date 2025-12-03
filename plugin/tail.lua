@@ -9,35 +9,7 @@
 --   :TailTimestampDisable
 --   :TailTimestampToggle
 --
--- Behaviour:
---   - For real file buffers:
---       * :TailEnable
---           - reloads the file from disk into the current buffer
---           - converts the buffer into a scratch "tail buffer"
---             (buftype=nofile, tail://<path>, no swap, viewer only)
---           - starts a Lua poller:
---               · every 1s: check file size
---               · read only newly appended bytes
---               · append new lines to THIS buffer
---           - installs simple follow logic:
---               · if cursor is on last line → follow
---               · if you scroll up → no follow
---           - DOES NOT call tail.enable() for this case.
---
---       * :TailTimestampEnable
---           - backfills timestamps into existing lines (prefix text)
---           - timestamps all future lines appended by the poller.
---
---       * :TailTimestampDisable
---           - stops adding timestamps to future lines (no cleanup).
---
---       * This buffer is now detached from the file, so there will be:
---           · no W11 / W12 warnings
---           · always “outloaded” view from disk handled by the poller.
---
---   - For non-file buffers (internal, job output, etc.):
---       * :TailEnable just calls tail.enable(bufnr).
---       * Timestamp commands delegate to tail.nvim.
+--   We treat files (as they may be buffered) separately from other buffers in here.
 
 local tail       = require("tail")
 
