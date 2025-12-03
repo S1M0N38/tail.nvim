@@ -10,7 +10,7 @@
 --   :TailTimestampToggle
 --
 -- Behaviour:
---   - For real file buffers (e.g. test.log):
+--   - For real file buffers:
 --       * :TailEnable
 --           - reloads the file from disk into the current buffer
 --           - converts the buffer into a scratch "tail buffer"
@@ -35,9 +35,9 @@
 --           · no W11 / W12 warnings
 --           · always “outloaded” view from disk handled by the poller.
 --
---   - For non-file buffers (MQTT, job output, etc.):
---       * :TailEnable just calls tail.enable(bufnr) as before.
---       * Timestamp commands delegate to tail.nvim as before.
+--   - For non-file buffers (internal, job output, etc.):
+--       * :TailEnable just calls tail.enable(bufnr).
+--       * Timestamp commands delegate to tail.nvim.
 
 local tail       = require("tail")
 
