@@ -233,6 +233,26 @@ function M.enable(bufnr)
 		ws.pinned = true
 		jump_to_bottom(bufnr, winid)
 	end
+
+	-- Turn on autoread locally
+	vim.bo[bufnr].autoread = true
+
+	-- Unique augroup per buffer so disabling doesn't affect others
+	local group = vim.api.nvim_create_augroup("tail_autoread_" .. bufnr, { clear = true })
+
+	vim.api.nvim_create_autocmd(
+		{ "CursorHold", "CursorHoldI", "FocusGained", "BufEnter" },
+		{
+			group = group,
+			buffer = bufnr,
+			callback = function()
+				-- Only reload if tailing is still enabled for this buffer
+				local state = buf_state[bufnr]
+				if state and state.enabled then
+					pcall(vim.cmd, "checktime " .. bufnr)
+				end
+			end,
+		})
 end
 
 function M.disable(bufnr)
