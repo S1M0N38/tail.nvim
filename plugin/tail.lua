@@ -9,7 +9,9 @@
 --   :TailTimestampDisable
 --   :TailTimestampToggle
 --
---   We treat files (as they may be buffered) separately from other buffers in here.
+--   We treat files (as they may be buffered) separately from other buffers in here. As (neo)vim has problems with
+--   reliable reloading buffered files, we use our own timer to watch over a files changes. The rest of this file
+--   plugs that into the other code in init.lua.
 
 local tail       = require("tail")
 
@@ -145,7 +147,7 @@ local function start_file_poller(bufnr)
 	file_cfg[bufnr] = file_cfg[bufnr] or {
 		follow     = (tail.opts and tail.opts.follow) ~= false, -- default to true
 		ts_enabled = (tail.opts and tail.opts.timestamps) == true, -- default to false
-		ts_format  = (tail.opts and tail.opts.timestamp_format) or "%Y-%m-%d %H:%M:%S",
+		ts_format  = (tail.opts and tail.opts.timestamp_format) or "%Y-%m-%d %H:%M:%S ",
 		ts_hl      = (tail.opts and tail.opts.timestamp_highlight) or "Comment",
 	}
 
@@ -289,7 +291,7 @@ local function file_timestamps_enable(bufnr, opts)
 		cfg = {
 			follow     = true,
 			ts_enabled = false,
-			ts_format  = "%Y-%m-%d %H:%M:%S",
+			ts_format  = "%Y-%m-%d %H:%M:%S ",
 		}
 		file_cfg[bufnr] = cfg
 	end
@@ -297,15 +299,29 @@ local function file_timestamps_enable(bufnr, opts)
 	cfg.ts_enabled = true
 
 	if opts.backfill then
-		local fmt   = cfg.ts_format or "%Y-%m-%d %H:%M:%S"
 		local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, true)
 		for i, line in ipairs(lines) do
 			if line ~= "" and not line:match("^%d%d%d%d%-%d%d%-%d%d") then
-				lines[i] = os.date(fmt) .. " " .. line
+				local fmt = cfg.ts_format or "%Y-%m-%d %H:%M:%S"
+				local ts  = os.date(fmt)
+				lines[i]  = ts .. " " .. line
 			end
 		end
 		vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
 		vim.bo[bufnr].modified = false
+
+		-- Apply highlighting after lines are written
+		local ns_tail = vim.api.nvim_create_namespace("tail-timestamp")
+		for i = 1, #lines do
+			local line = vim.api.nvim_buf_get_lines(bufnr, i - 1, i, false)[1]
+			local ts_match = line:match("^(%d%d%d%d%-%d%d%-%d%d %d%d:%d%d:%d%d)")
+			if ts_match then
+				vim.api.nvim_buf_set_extmark(bufnr, ns_tail, i - 1, 0, {
+					end_col = #ts_match,
+					hl_group = cfg.ts_highlight or "Comment",
+				})
+			end
+		end
 	end
 end
 
