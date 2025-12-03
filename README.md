@@ -13,6 +13,7 @@ optionally display a timestamp before each new line using virtual text.
 ### Demo
 
 On synthetic logfile that has new line written to it every second:
+
 ![tail.nvim Demo][demo_tail.gif]
 
 ## Installation
@@ -97,3 +98,6 @@ require("tail").timestamps_toggle(bufnr, { backfill = false })
 ## License
 
 MIT
+
+
+[demo_tail.gif]: demo_tail.gif
