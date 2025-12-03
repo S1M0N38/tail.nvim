@@ -1,6 +1,6 @@
 -- plugin/tail.lua
 --
--- User commands:
+-- Commands:
 --   :TailEnable
 --   :TailDisable
 --   :TailToggle
@@ -10,18 +10,45 @@
 --   :TailTimestampToggle
 --
 -- Behaviour:
---   - If :TailEnable is called on a *real file buffer*:
---       * opens a split *above* the current window
---       * shows a scratch "tail://<path>" buffer there
---       * feeds `tail -F <path>` into that buffer
---       * enables tail.nvim + timestamps on that scratch buffer
---   - If called on any other buffer (MQTT / already tail:// / etc.):
---       * just calls tail.enable(bufnr) as before.
+--   - For real file buffers (e.g. test.log):
+--       * :TailEnable
+--           - reloads the file from disk into the current buffer
+--           - converts the buffer into a scratch "tail buffer"
+--             (buftype=nofile, tail://<path>, no swap, viewer only)
+--           - starts a Lua poller:
+--               · every 1s: check file size
+--               · read only newly appended bytes
+--               · append new lines to THIS buffer
+--           - installs simple follow logic:
+--               · if cursor is on last line → follow
+--               · if you scroll up → no follow
+--           - DOES NOT call tail.enable() for this case.
+--
+--       * :TailTimestampEnable
+--           - backfills timestamps into existing lines (prefix text)
+--           - timestamps all future lines appended by the poller.
+--
+--       * :TailTimestampDisable
+--           - stops adding timestamps to future lines (no cleanup).
+--
+--       * This buffer is now detached from the file, so there will be:
+--           · no W11 / W12 warnings
+--           · always “outloaded” view from disk handled by the poller.
+--
+--   - For non-file buffers (MQTT, job output, etc.):
+--       * :TailEnable just calls tail.enable(bufnr) as before.
+--       * Timestamp commands delegate to tail.nvim as before.
 
-local tail = require("tail")
+local tail       = require("tail")
 
--- scratch_bufnr -> job_id for tail -F
-local jobs = {}
+-- per-buffer polling / config state for FILE-tail buffers
+local timers     = {} -- bufnr -> uv_timer
+local file_state = {} -- bufnr -> { path, offset, partial }
+local file_cfg   = {} -- bufnr -> { follow = bool, ts_enabled = bool, ts_format = string }
+
+----------------------------------------------------------------------
+-- Helper: is this buffer a regular file on disk (before tail mode)?
+----------------------------------------------------------------------
 
 local function is_regular_file_buf(bufnr)
 	if vim.bo[bufnr].buftype ~= "" then
@@ -29,12 +56,7 @@ local function is_regular_file_buf(bufnr)
 	end
 
 	local name = vim.api.nvim_buf_get_name(bufnr)
-	if name == nil or name == "" then
-		return false
-	end
-
-	-- don't re-wrap our own scratch buffers
-	if name:match("^tail://") then
+	if not name or name == "" then
 		return false
 	end
 
@@ -42,150 +64,364 @@ local function is_regular_file_buf(bufnr)
 	return stat ~= nil and stat.type == "file"
 end
 
-local function start_tail_job_for_file(bufnr)
+----------------------------------------------------------------------
+-- Convert a real file buffer into a "tail buffer":
+--   - reloads file contents from disk
+--   - makes buffer 'nofile', 'tail://<path>', no swap, viewer-only
+----------------------------------------------------------------------
+
+local function make_tail_buffer_from_file(bufnr)
 	local path = vim.api.nvim_buf_get_name(bufnr)
-	if path == nil or path == "" then
+	if not path or path == "" then
 		return nil
 	end
 
-	-- create an unlisted scratch buffer
-	local scratch = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_name(scratch, "tail://" .. path)
-
-	-- scratch buffer options: no file on disk, no swap, auto-wipe, no save nags
-	vim.bo[scratch].buftype    = "nofile"
-	vim.bo[scratch].bufhidden  = "wipe"
-	vim.bo[scratch].swapfile   = false
-	vim.bo[scratch].modifiable = true
-	vim.bo[scratch].filetype   = vim.bo[bufnr].filetype
-
-	-- open a split *above* the current window and show the scratch buffer there
-	local cur_win              = vim.api.nvim_get_current_win()
-	vim.cmd("aboveleft split")
-	local win = vim.api.nvim_get_current_win()
-	vim.api.nvim_win_set_buf(win, scratch)
-
-	-- optionally, make the top window smaller
-	local cur_height = vim.api.nvim_win_get_height(cur_win)
-	local new_height = math.max(5, math.floor(cur_height / 3))
-	pcall(vim.api.nvim_win_set_height, win, new_height)
-
-	local job_id = vim.fn.jobstart({ "tail", "-F", path }, {
-		stdout_buffered = false,
-		on_stdout = function(_, data, _)
-			if not data then
-				return
-			end
-			if #data > 0 and data[#data] == "" then
-				table.remove(data)
-			end
-			if #data == 0 then
-				return
-			end
-			if not vim.api.nvim_buf_is_valid(scratch) then
-				return
-			end
-
-			vim.api.nvim_buf_set_lines(scratch, -1, -1, false, data)
-			-- prevent "No write since last change" when closing this buffer
-			vim.bo[scratch].modified = false
-		end,
-		on_exit = function()
-			jobs[scratch] = nil
-			if vim.api.nvim_buf_is_valid(scratch) then
-				vim.api.nvim_buf_set_lines(
-					scratch,
-					-1,
-					-1,
-					false,
-					{ "[tail.nvim] tail -F exited for " .. path }
-				)
-				vim.bo[scratch].modified = false
-			end
-		end,
-	})
-
-	if job_id <= 0 then
-		if vim.api.nvim_buf_is_valid(scratch) then
-			vim.api.nvim_buf_set_lines(
-				scratch,
-				-1,
-				-1,
-				false,
-				{ "[tail.nvim] failed to start tail -F for " .. path }
-			)
-			vim.bo[scratch].modified = false
-		end
-	else
-		jobs[scratch] = job_id
+	-- reload full file from disk to avoid missing any lines
+	local ok, lines = pcall(vim.fn.readfile, path)
+	if not ok or not lines then
+		return nil
 	end
 
-	return scratch
+	vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+
+	-- store original path in buffer-local var
+	vim.b[bufnr].tail_file_path = path
+
+	-- convert to scratch "tail buffer"
+	vim.bo[bufnr].buftype       = "nofile"
+	vim.bo[bufnr].bufhidden     = "wipe"
+	vim.bo[bufnr].swapfile      = false
+	vim.bo[bufnr].modifiable    = true
+
+	-- rename so it's clearly not a real file
+	vim.api.nvim_buf_set_name(bufnr, "tail://" .. path)
+
+	-- mark as unmodified (it's just a view)
+	vim.bo[bufnr].modified = false
+
+	return path
 end
 
 ----------------------------------------------------------------------
--- Core tail commands
+-- Follow logic for tail buffers:
+--   - follow[bufnr] = true  => auto-jump to bottom on new lines
+--   - follow[bufnr] = false => user scrolled up, do not jump
+----------------------------------------------------------------------
+
+local function setup_follow_autocmd(bufnr)
+	local group_name = "tail_file_follow_" .. bufnr
+	local group = vim.api.nvim_create_augroup(group_name, { clear = true })
+
+	vim.api.nvim_create_autocmd({ "CursorMoved", "WinScrolled" }, {
+		group = group,
+		buffer = bufnr,
+		callback = function(args)
+			local b = args.buf
+			local cfg = file_cfg[b]
+			if not cfg then
+				return
+			end
+
+			local win = vim.api.nvim_get_current_win()
+			if not vim.api.nvim_win_is_valid(win) then
+				return
+			end
+			if vim.api.nvim_win_get_buf(win) ~= b then
+				return
+			end
+
+			local cur  = vim.api.nvim_win_get_cursor(win)[1]
+			local last = vim.api.nvim_buf_line_count(b)
+
+			if cur < last then
+				cfg.follow = false
+			else
+				cfg.follow = true
+			end
+		end,
+	})
+end
+
+local function clear_follow_autocmd(bufnr)
+	local group_name = "tail_file_follow_" .. bufnr
+	pcall(vim.api.nvim_del_augroup_by_name, group_name)
+end
+
+----------------------------------------------------------------------
+-- Start polling a file and appending new lines into the tail buffer
+----------------------------------------------------------------------
+
+local function start_file_poller(bufnr)
+	local path = vim.b[bufnr].tail_file_path
+	if not path or path == "" then
+		return
+	end
+
+	local stat = vim.loop.fs_stat(path)
+	if not stat or not stat.size then
+		return
+	end
+
+	-- initial file state: we just loaded the full file, so start at EOF
+	file_state[bufnr] = {
+		path    = path,
+		offset  = stat.size,
+		partial = "",
+	}
+
+	-- initial config for this buffer
+	file_cfg[bufnr] = file_cfg[bufnr] or {
+		follow     = true,
+		ts_enabled = false,
+		ts_format  = "%Y-%m-%d %H:%M:%S",
+	}
+
+	-- move cursor to bottom initially
+	local last = vim.api.nvim_buf_line_count(bufnr)
+	if last > 0 then
+		pcall(vim.api.nvim_win_set_cursor, vim.api.nvim_get_current_win(), { last, 0 })
+	end
+
+	setup_follow_autocmd(bufnr)
+
+	if timers[bufnr] then
+		return
+	end
+
+	local timer = vim.loop.new_timer()
+	timers[bufnr] = timer
+
+	timer:start(0, 1000, function()
+		vim.schedule(function()
+			if not vim.api.nvim_buf_is_valid(bufnr) then
+				if timers[bufnr] then
+					timers[bufnr]:stop()
+					timers[bufnr]:close()
+					timers[bufnr] = nil
+				end
+				file_state[bufnr] = nil
+				file_cfg[bufnr]   = nil
+				clear_follow_autocmd(bufnr)
+				return
+			end
+
+			local st  = file_state[bufnr]
+			local cfg = file_cfg[bufnr]
+			if not st or not cfg then
+				return
+			end
+
+			local s = vim.loop.fs_stat(st.path)
+			if not s or not s.size or s.size <= st.offset then
+				return -- no new data
+			end
+
+			local fd = vim.loop.fs_open(st.path, "r", 438) -- 0666
+			if not fd then
+				return
+			end
+
+			local to_read = s.size - st.offset
+			local data = vim.loop.fs_read(fd, to_read, st.offset)
+			vim.loop.fs_close(fd)
+
+			st.offset = s.size
+
+			if not data or #data == 0 then
+				return
+			end
+
+			-- prepend leftover partial from previous read
+			local buf = st.partial .. data
+			st.partial = ""
+
+			local lines = {}
+			local i = 1
+			while true do
+				local j = buf:find("\n", i, true)
+				if not j then
+					st.partial = buf:sub(i)
+					break
+				end
+				table.insert(lines, buf:sub(i, j - 1))
+				i = j + 1
+			end
+
+			if #lines == 0 then
+				return
+			end
+
+			-- timestamps for new lines if enabled
+			if cfg.ts_enabled then
+				local fmt = cfg.ts_format or "%Y-%m-%d %H:%M:%S"
+				local ts  = os.date(fmt)
+				for idx, line in ipairs(lines) do
+					-- avoid double-stamping lines that already look like timestamps
+					if not line:match("^%d%d%d%d%-%d%d%-%d%d") then
+						lines[idx] = ts .. " " .. line
+					end
+				end
+			end
+
+			vim.api.nvim_buf_set_lines(bufnr, -1, -1, false, lines)
+			vim.bo[bufnr].modified = false -- still just a view
+
+			-- follow behaviour: only jump if follow=true
+			if cfg.follow then
+				local wins = vim.fn.win_findbuf(bufnr)
+				local last_line = vim.api.nvim_buf_line_count(bufnr)
+				for _, win in ipairs(wins) do
+					if vim.api.nvim_win_is_valid(win) then
+						pcall(vim.api.nvim_win_set_cursor, win, { last_line, 0 })
+					end
+				end
+			end
+		end)
+	end)
+end
+
+local function stop_file_poller(bufnr)
+	local t = timers[bufnr]
+	if t then
+		t:stop()
+		t:close()
+		timers[bufnr] = nil
+	end
+	file_state[bufnr] = nil
+	file_cfg[bufnr]   = nil
+	clear_follow_autocmd(bufnr)
+end
+
+----------------------------------------------------------------------
+-- Timestamp handling for FILE-tail buffers only (text prefix)
+----------------------------------------------------------------------
+
+local function file_timestamps_enable(bufnr, opts)
+	opts = opts or {}
+	local cfg = file_cfg[bufnr]
+	if not cfg then
+		cfg = {
+			follow     = true,
+			ts_enabled = false,
+			ts_format  = "%Y-%m-%d %H:%M:%S",
+		}
+		file_cfg[bufnr] = cfg
+	end
+
+	cfg.ts_enabled = true
+
+	if opts.backfill then
+		local fmt   = cfg.ts_format or "%Y-%m-%d %H:%M:%S"
+		local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, true)
+		for i, line in ipairs(lines) do
+			if line ~= "" and not line:match("^%d%d%d%d%-%d%d%-%d%d") then
+				lines[i] = os.date(fmt) .. " " .. line
+			end
+		end
+		vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+		vim.bo[bufnr].modified = false
+	end
+end
+
+local function file_timestamps_disable(bufnr)
+	local cfg = file_cfg[bufnr]
+	if not cfg then
+		return
+	end
+	cfg.ts_enabled = false
+end
+
+----------------------------------------------------------------------
+-- Core commands
 ----------------------------------------------------------------------
 
 vim.api.nvim_create_user_command("TailEnable", function()
 	local bufnr = vim.api.nvim_get_current_buf()
 
 	if is_regular_file_buf(bufnr) then
-		-- external file: create streaming scratch buffer above and tail it
-		local scratch = start_tail_job_for_file(bufnr)
-		if scratch and vim.api.nvim_buf_is_valid(scratch) then
-			tail.enable(scratch)
-			-- no backfill here: only new lines get timestamps by default
-			tail.timestamps_enable(scratch, { backfill = false })
+		-- Real file: convert to tail buffer and start poller
+		local path = make_tail_buffer_from_file(bufnr)
+		if path then
+			start_file_poller(bufnr)
 		end
 	else
-		-- MQTT / internal buffer / already tail:// → just use normal behaviour
+		-- Non-file buffer (MQTT etc.): use original tail.nvim behaviour
 		tail.enable(bufnr)
 	end
 end, {
-	desc = "Enable tail.nvim for current buffer (auto tail -F + split for file buffers)",
+	desc = "Enable tail mode (file buffers → poller; others → tail.nvim)",
 })
 
 vim.api.nvim_create_user_command("TailDisable", function()
 	local bufnr = vim.api.nvim_get_current_buf()
 
-	-- stop external tail job if this is a scratch tail buffer
-	local job_id = jobs[bufnr]
-	if job_id then
-		pcall(vim.fn.jobstop, job_id)
-		jobs[bufnr] = nil
+	if vim.b[bufnr].tail_file_path then
+		-- This is a tail buffer detached from a file
+		stop_file_poller(bufnr)
+	else
+		-- Regular buffer handled by tail.nvim
+		tail.disable(bufnr)
 	end
-
-	tail.disable(bufnr)
 end, {
-	desc = "Disable tail.nvim for current buffer (stops tail -F if used)",
+	desc = "Disable tail mode (and stop poller if used)",
 })
 
 vim.api.nvim_create_user_command("TailToggle", function()
-	-- simple toggle; job handling is minimal here
-	tail.toggle()
+	local bufnr = vim.api.nvim_get_current_buf()
+
+	if vim.b[bufnr].tail_file_path then
+		if timers[bufnr] then
+			stop_file_poller(bufnr)
+		else
+			start_file_poller(bufnr)
+		end
+	else
+		tail.toggle()
+	end
 end, {
-	desc = "Toggle tail.nvim for current buffer",
+	desc = "Toggle tail mode (for file or non-file buffers)",
 })
 
 ----------------------------------------------------------------------
 -- Timestamp commands
+--   - File buffers (tail mode): our own behaviour (text prefix)
+--   - Other buffers: delegate to core tail.nvim
 ----------------------------------------------------------------------
 
 vim.api.nvim_create_user_command("TailTimestampEnable", function()
-	tail.timestamps_enable(nil, { backfill = true })
+	local bufnr = vim.api.nvim_get_current_buf()
+	if vim.b[bufnr].tail_file_path then
+		file_timestamps_enable(bufnr, { backfill = true })
+	else
+		tail.timestamps_enable(nil, { backfill = true })
+	end
 end, {
-	desc = "Enable per-line timestamps for current buffer (with backfill)",
+	desc = "Enable timestamps (file-tail: prefix; others: tail.nvim)",
 })
 
 vim.api.nvim_create_user_command("TailTimestampDisable", function()
-	tail.timestamps_disable()
+	local bufnr = vim.api.nvim_get_current_buf()
+	if vim.b[bufnr].tail_file_path then
+		file_timestamps_disable(bufnr)
+	else
+		tail.timestamps_disable()
+	end
 end, {
-	desc = "Disable per-line timestamps for current buffer",
+	desc = "Disable timestamps",
 })
 
 vim.api.nvim_create_user_command("TailTimestampToggle", function()
-	tail.timestamps_toggle(nil, { backfill = false })
+	local bufnr = vim.api.nvim_get_current_buf()
+	if vim.b[bufnr].tail_file_path then
+		local cfg = file_cfg[bufnr]
+		if cfg and cfg.ts_enabled then
+			file_timestamps_disable(bufnr)
+		else
+			file_timestamps_enable(bufnr, { backfill = false })
+		end
+	else
+		tail.timestamps_toggle(nil, { backfill = false })
+	end
 end, {
-	desc = "Toggle per-line timestamps for current buffer",
+	desc = "Toggle timestamps",
 })
