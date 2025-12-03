@@ -10,6 +10,11 @@ optionally display a timestamp before each new line using virtual text.
 - Works on any buffer type: `nofile`, plugin buffers, etc. Your mileage may vary for writeable or "exotic" buffers like :terminal
 - Optional per-buffer timestamps: prefix newly inserted lines with the current time. The timestamp is drawn with virtual text, so it does not modify the file’s content.
 
+### Demo
+
+On synthetic logfile that has new line written to it every second:
+![tail.nvim Demo][demo_tail.gif]
+
 ## Installation
 
 ### Using a plugin manager
