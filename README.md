@@ -9,6 +9,7 @@ optionally display a timestamp before each new line using virtual text.
 - Respects user scrolling: won't yank you back if you've moved up
 - Works on any buffer type: `nofile`, plugin buffers, etc. Your mileage may vary for writeable or "exotic" buffers like :terminal
 - Optional per-buffer timestamps: prefix newly inserted lines with the current time. The timestamp is drawn with virtual text, so it does not modify the file’s content.
+- Does not move the cursor position on activation by default. Use neovim's move to end of buffer, default: Shift + g.
 
 ### Demo
 
@@ -68,7 +69,11 @@ Similarily the timestamps are controlled:
 :TailTimestampDisable
 ```
 
-When viewing files, you might have to tell vim it shall reload the file often:
+The actual following behavior might not directly work, as the cursor position is not changed
+on plugin activation by default for compatibility reasons. You can always use neovims integrated
+feature "move to end of buffer", default keymap is: Shift + g
+
+When viewing file buffers specifically, you might have to tell vim it shall reload the file often:
 
 ```vim
 " automatically notice external file changes
