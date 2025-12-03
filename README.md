@@ -62,6 +62,15 @@ Similarily the timestamps are controlled:
 :TailTimestampDisable
 ```
 
+When viewing files, you might have to tell vim it shall reload the file often:
+
+```vim
+" automatically notice external file changes
+set autoread
+" actually *check* for changes regularly
+autocmd CursorHold,CursorHoldI,FocusGained,BufEnter * checktime
+```
+
 ## API
 
 This plugin exposes the following Lua functions:
