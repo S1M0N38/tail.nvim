@@ -16,7 +16,7 @@ local tail       = require("tail")
 -- per-buffer polling / config state for FILE-tail buffers
 local timers     = {} -- bufnr -> uv_timer
 local file_state = {} -- bufnr -> { path, offset, partial }
-local file_cfg   = {} -- bufnr -> { follow = bool, ts_enabled = bool, ts_format = string }
+local file_cfg   = {} -- bufnr -> { follow = bool, ts_enabled = bool, ts_format = string, ts_hl = string }
 
 ----------------------------------------------------------------------
 -- Helper: is this buffer a regular file on disk (before tail mode)?
@@ -143,9 +143,10 @@ local function start_file_poller(bufnr)
 
 	-- initial config for this buffer
 	file_cfg[bufnr] = file_cfg[bufnr] or {
-		follow     = true,
-		ts_enabled = false,
-		ts_format  = "%Y-%m-%d %H:%M:%S",
+		follow     = (tail.opts and tail.opts.follow) ~= false, -- default to true
+		ts_enabled = (tail.opts and tail.opts.timestamps) == true, -- default to false
+		ts_format  = (tail.opts and tail.opts.timestamp_format) or "%Y-%m-%d %H:%M:%S",
+		ts_hl      = (tail.opts and tail.opts.timestamp_highlight) or "Comment",
 	}
 
 	-- move cursor to bottom initially
@@ -232,6 +233,19 @@ local function start_file_poller(bufnr)
 					if not line:match("^%d%d%d%d%-%d%d%-%d%d") then
 						lines[idx] = ts .. " " .. line
 					end
+				end
+
+				local ns_tail = vim.api.nvim_create_namespace("tail-timestamp")
+				local line_offset = vim.api.nvim_buf_line_count(bufnr) - #lines
+
+				for i = 1, #lines do
+					local line = vim.api.nvim_buf_get_lines(bufnr, line_offset + i - 1,
+						line_offset + i, false)[1]
+					local end_col = math.min(#ts, #line)
+					vim.api.nvim_buf_set_extmark(bufnr, ns_tail, line_offset + i - 1, 0, {
+						end_col = end_col,
+						hl_group = cfg.ts_highlight or "Comment",
+					})
 				end
 			end
 
